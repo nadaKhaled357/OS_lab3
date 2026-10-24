@@ -4,7 +4,6 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <string.h>
-#include <errno.h>
 #include <signal.h>
 #include <fcntl.h>
 #include <time.h>
@@ -18,13 +17,12 @@
 #include "command.h"
 #include "tokenizer.h"
 
-int logFile = -1;
+FILE *logFile;
 
 void writeLog(int pid)
 {
-    char line[100];
-    snprintf(line, sizeof(line), "Child process %d terminated\n", pid);
-    write(logFile, line, strlen(line));
+    fprintf(logFile, "Child process %d terminated\n", pid);
+    fflush(logFile);
 }
 
 void childFinished(int sig)
@@ -36,152 +34,110 @@ void childFinished(int sig)
     }
 }
 
-std::string getWord(std::vector<Token> &tokens, int &i)
-{
-    std::string word = tokens[i].value;
-
-    if (word[0] == '"')
-    {
-        while (tokens[i + 1].type != TOKEN_EOF && !(word.size() > 1 && word[word.size() - 1] == '"'))
-        {
-            i++;
-            word = word + " " + tokens[i].value;
-        }
-    }
-
-    std::string result = "";
-    for (int k = 0; k < word.size(); k++)
-    {
-        if (word[k] != '"')
-        {
-            result = result + word[k];
-        }
-    }
-    return result;
-}
-
-bool isWord(Token &token)
-{
-    return token.type == TOKEN_COMMAND || token.type == TOKEN_ARGUMENT;
-}
-
-void parseError(const char *message, SimpleCommand *current)
-{
-    printf("myshell: %s\n", message);
-    if (current != NULL)
-    {
-        Command::_currentCommand.insertSimpleCommand(current);
-    }
-    Command::_currentCommand.clear();
-}
-
 void parse(std::vector<Token> &tokens)
 {
-    Command &command = Command::_currentCommand;
-    SimpleCommand *current = NULL;
-    bool afterPipe = false;
+    Command currentCommand;
+    SimpleCommand *currentSimpleCommand = new SimpleCommand();
 
     for (int i = 0; tokens[i].type != TOKEN_EOF; i++)
     {
         TokenType type = tokens[i].type;
+        std::string word = tokens[i].value;
 
         if (type == TOKEN_PIPE)
         {
-            if (current == NULL)
+            if (currentSimpleCommand->_numberOfArguments == 0)
             {
-                parseError("syntax error: missing command before |", current);
+                printf("myshell: syntax error near |\n");
+                currentCommand.clear();
                 return;
             }
-            command.insertSimpleCommand(current);
-            current = NULL;
-            afterPipe = true;
+            currentCommand.insertSimpleCommand(currentSimpleCommand);
+            currentSimpleCommand = new SimpleCommand();
+            if (tokens[i + 1].type == TOKEN_EOF)
+            {
+                printf("myshell: missing command after |\n");
+                currentCommand.clear();
+                return;
+            }
         }
         else if (type == TOKEN_BACKGROUND)
         {
-            if (tokens[i + 1].type != TOKEN_EOF)
-            {
-                parseError("syntax error: & must be at the end of the command", current);
-                return;
-            }
-            command._background = 1;
+            currentCommand._background = 1;
         }
         else if (type == TOKEN_REDIRECT || type == TOKEN_APPEND || type == TOKEN_INPUT ||
                  type == TOKEN_ERROR || type == TOKEN_REDIRECT_AND_ERROR)
         {
-            if (!isWord(tokens[i + 1]))
+            i++;
+            if (tokens[i].type != TOKEN_COMMAND && tokens[i].type != TOKEN_ARGUMENT)
             {
-                std::string message = "syntax error: missing file name after " + tokens[i].value;
-                parseError(message.c_str(), current);
+                printf("myshell: missing file name after %s\n", word.c_str());
+                currentCommand.clear();
                 return;
             }
-            i++;
-            std::string name = getWord(tokens, i);
+            char *file = strdup(tokens[i].value.c_str());
 
             if (type == TOKEN_INPUT)
             {
-                if (command._inputFile)
-                    free(command._inputFile);
-                command._inputFile = strdup(name.c_str());
+                currentCommand._inputFile = file;
             }
             else if (type == TOKEN_ERROR)
             {
-                if (command._errFile)
-                    free(command._errFile);
-                command._errFile = strdup(name.c_str());
+                currentCommand._errFile = file;
             }
             else
             {
-                if (command._outFile)
-                    free(command._outFile);
-                command._outFile = strdup(name.c_str());
-                command._append = 0;
-
+                currentCommand._outFile = file;
                 if (type == TOKEN_APPEND || type == TOKEN_REDIRECT_AND_ERROR)
                 {
-                    command._append = 1;
+                    currentCommand._append = 1;
                 }
                 if (type == TOKEN_REDIRECT_AND_ERROR)
                 {
-                    command._out_error = 1;
-                    if (command._errFile)
-                        free(command._errFile);
-                    command._errFile = strdup(name.c_str());
+                    currentCommand._out_error = 1;
+                    currentCommand._errFile = strdup(file);
                 }
             }
         }
         else
         {
-            std::string word = getWord(tokens, i);
-            if (current == NULL)
+            if (word[0] == '"')
             {
-                current = new SimpleCommand();
+                while (tokens[i + 1].type != TOKEN_EOF && word[word.size() - 1] != '"')
+                {
+                    i++;
+                    word = word + " " + tokens[i].value;
+                }
             }
-            current->insertArgument(strdup(word.c_str()));
-            afterPipe = false;
+            std::string clean = "";
+            for (int k = 0; k < word.size(); k++)
+            {
+                if (word[k] != '"')
+                {
+                    clean = clean + word[k];
+                }
+            }
+            currentSimpleCommand->insertArgument(strdup(clean.c_str()));
         }
     }
 
-    if (afterPipe)
+    if (currentSimpleCommand->_numberOfArguments > 0)
     {
-        parseError("syntax error: missing command after |", current);
-        return;
+        currentCommand.insertSimpleCommand(currentSimpleCommand);
     }
 
-    if (current != NULL)
+    if (currentCommand._numberOfSimpleCommands > 0)
     {
-        command.insertSimpleCommand(current);
+        currentCommand.execute();
     }
-
-    if (command._numberOfSimpleCommands == 0)
+    else
     {
-        if (command._outFile || command._inputFile || command._errFile || command._background)
+        if (currentCommand._outFile || currentCommand._inputFile || currentCommand._errFile)
         {
-            parseError("syntax error: missing command", NULL);
+            printf("myshell: missing command\n");
         }
-        return;
+        currentCommand.clear();
     }
-
-    command.execute();
 }
 
 SimpleCommand::SimpleCommand()
@@ -244,7 +200,7 @@ void Command::clear()
         }
 
         free(_simpleCommands[i]->_arguments);
-        delete _simpleCommands[i];
+        free(_simpleCommands[i]);
     }
 
     if (_outFile)
@@ -293,8 +249,8 @@ void Command::print()
     printf("  Output       Input        Error        Err&Out       Background\n");
     printf("  ------------ ------------ ------------ ------------ ------------\n");
     printf("  %-12s %-12s %-12s %-12s %-12s\n", _outFile ? _outFile : "default",
-           _inputFile ? _inputFile : "default", _errFile ? _errFile : "default",
-           _out_error == 1 ? _errFile : "default", _background ? "YES" : "NO");
+           _inputFile ? _inputFile : "default", _errFile ? _errFile : "default", _out_error == 1 ? _errFile : "default"
+           ,_background ? "YES" : "NO");
     printf("\n\n");
 }
 
@@ -307,25 +263,19 @@ void Command::execute()
     if (strcmp(first, "exit") == 0)
     {
         printf("Good bye!!\n");
-        clear();
         exit(0);
     }
 
     if (strcmp(first, "cd") == 0)
     {
-        char *dir;
+        char *dir = getenv("HOME");
         if (_simpleCommands[0]->_numberOfArguments > 1)
         {
             dir = _simpleCommands[0]->_arguments[1];
         }
-        else
-        {
-            dir = getenv("HOME");
-        }
-
         if (chdir(dir) != 0)
         {
-            printf("myshell: cd: %s: %s\n", dir, strerror(errno));
+            printf("myshell: cd: %s: No such file or directory\n", dir);
         }
         clear();
         return;
@@ -340,29 +290,18 @@ void Command::execute()
         inFd = open(_inputFile, O_RDONLY);
         if (inFd < 0)
         {
-            printf("myshell: %s: %s\n", _inputFile, strerror(errno));
+            printf("myshell: %s: No such file or directory\n", _inputFile);
             clear();
             return;
         }
     }
-
     if (_outFile)
     {
         if (_append)
             outFd = open(_outFile, O_WRONLY | O_CREAT | O_APPEND, 0644);
         else
             outFd = open(_outFile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-
-        if (outFd < 0)
-        {
-            printf("myshell: %s: %s\n", _outFile, strerror(errno));
-            if (inFd >= 0)
-                close(inFd);
-            clear();
-            return;
-        }
     }
-
     if (_out_error == 1)
     {
         errFd = outFd;
@@ -370,44 +309,21 @@ void Command::execute()
     else if (_errFile)
     {
         errFd = open(_errFile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (errFd < 0)
-        {
-            printf("myshell: %s: %s\n", _errFile, strerror(errno));
-            if (inFd >= 0)
-                close(inFd);
-            if (outFd >= 0)
-                close(outFd);
-            clear();
-            return;
-        }
     }
 
-    int previousRead = -1;
-    int lastPid = -1;
+    int n = _numberOfSimpleCommands;
+    int previous = -1;
+    int lastPid = 0;
 
-    for (int i = 0; i < _numberOfSimpleCommands; i++)
+    for (int i = 0; i < n; i++)
     {
-        int fds[2];
-        fds[0] = -1;
-        fds[1] = -1;
-
-        if (i < _numberOfSimpleCommands - 1)
+        int fds[2] = {-1, -1};
+        if (i < n - 1)
         {
-            if (pipe(fds) < 0)
-            {
-                printf("myshell: pipe: %s\n", strerror(errno));
-                break;
-            }
+            pipe(fds);
         }
 
         int pid = fork();
-
-        if (pid < 0)
-        {
-            printf("myshell: fork: %s\n", strerror(errno));
-            break;
-        }
-
         if (pid == 0)
         {
             signal(SIGINT, SIG_DFL);
@@ -415,14 +331,12 @@ void Command::execute()
             if (i == 0 && inFd >= 0)
                 dup2(inFd, 0);
             if (i > 0)
-                dup2(previousRead, 0);
-
-            if (i < _numberOfSimpleCommands - 1)
+                dup2(previous, 0);
+            if (i < n - 1)
                 dup2(fds[1], 1);
             else if (outFd >= 0)
                 dup2(outFd, 1);
-
-            if (i == _numberOfSimpleCommands - 1 && errFd >= 0)
+            if (i == n - 1 && errFd >= 0)
                 dup2(errFd, 2);
 
             if (inFd >= 0)
@@ -431,30 +345,26 @@ void Command::execute()
                 close(outFd);
             if (errFd >= 0 && errFd != outFd)
                 close(errFd);
-            if (previousRead >= 0)
-                close(previousRead);
+            if (previous >= 0)
+                close(previous);
             if (fds[0] >= 0)
                 close(fds[0]);
             if (fds[1] >= 0)
                 close(fds[1]);
 
             execvp(_simpleCommands[i]->_arguments[0], _simpleCommands[i]->_arguments);
-            fprintf(stderr, "myshell: %s: %s\n", _simpleCommands[i]->_arguments[0],
-                    errno == ENOENT ? "command not found" : strerror(errno));
-            _exit(1);
+            printf("myshell: %s: command not found\n", _simpleCommands[i]->_arguments[0]);
+            exit(1);
         }
 
         lastPid = pid;
-
-        if (previousRead >= 0)
-            close(previousRead);
+        if (previous >= 0)
+            close(previous);
         if (fds[1] >= 0)
             close(fds[1]);
-        previousRead = fds[0];
+        previous = fds[0];
     }
 
-    if (previousRead >= 0)
-        close(previousRead);
     if (inFd >= 0)
         close(inFd);
     if (outFd >= 0)
@@ -462,7 +372,7 @@ void Command::execute()
     if (errFd >= 0 && errFd != outFd)
         close(errFd);
 
-    if (!_background && lastPid > 0)
+    if (_background == 0)
     {
         int result = waitpid(lastPid, NULL, 0);
         if (result > 0)
@@ -478,20 +388,17 @@ void Command::prompt()
 {
     signal(SIGINT, SIG_IGN);
     signal(SIGCHLD, childFinished);
-    logFile = open("log.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    logFile = fopen("log.txt", "a");
 
     std::string input;
     while (true)
     {
         printf("myshell>");
         fflush(stdout);
-
         if (!std::getline(std::cin, input))
         {
-            printf("\n");
             break;
         }
-
         std::vector<Token> tokens = tokenize(input);
         parse(tokens);
     }
